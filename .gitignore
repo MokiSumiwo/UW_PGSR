@@ -1,0 +1,52 @@
+# Python and native extension build products
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.a
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local data, model weights, training outputs, and logs
+/data/
+/datasets/
+/output/
+/outputs/
+/logs/
+/checkpoints/
+/wandb/
+*.pth
+*.pt
+*.ckpt
+*.log
+events.out.tfevents.*
+
+# Editor, OS, secrets, and temporary files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.bak
+*.bak_*
+*~
+/=1.11.2
+
+# Local paper drafts, writing packets, and research workflow state
+/论文/
+/research_os/
+/main_modified.tex
+/paper_input_*.txt
+/clam验证_*.txt
+/论文自检任务.txt
+/UW_PGSR_4.8.2_innovation_mechanism_table.md

@@ -67,6 +67,10 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.empty(0)
         self.denom = torch.empty(0)
         self.denom_abs = torch.empty(0)
+        # --- New: background double-evidence pruning accumulators (robust, optional) ---
+        # These are NOT optimizable params; just persistent per-Gaussian stats.
+        self.bg_prune_seen = torch.empty(0)
+        self.bg_prune_hit = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -91,33 +95,63 @@ class GaussianModel:
             self.xyz_gradient_accum_abs,
             self.denom,
             self.denom_abs,
+            # --- bg prune accumulators (optional; backward-compatible restore handles missing) ---
+            self.bg_prune_seen,
+            self.bg_prune_hit,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._knn_f,
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        self.max_weight,
-        xyz_gradient_accum, 
-        xyz_gradient_accum_abs,
-        denom,
-        denom_abs,
-        opt_dict, 
-        self.spatial_lr_scale,
-        ) = model_args
+        # Backward-compatible unpack: older checkpoints may not have bg_prune_seen/bg_prune_hit.
+        if len(model_args) >= 18:
+            (self.active_sh_degree,
+             self._xyz,
+             self._knn_f,
+             self._features_dc,
+             self._features_rest,
+             self._scaling,
+             self._rotation,
+             self._opacity,
+             self.max_radii2D,
+             self.max_weight,
+             xyz_gradient_accum,
+             xyz_gradient_accum_abs,
+             denom,
+             denom_abs,
+             bg_prune_seen,
+             bg_prune_hit,
+             opt_dict,
+             self.spatial_lr_scale) = model_args
+            self.bg_prune_seen = bg_prune_seen
+            self.bg_prune_hit = bg_prune_hit
+        else:
+            (self.active_sh_degree,
+             self._xyz,
+             self._knn_f,
+             self._features_dc,
+             self._features_rest,
+             self._scaling,
+             self._rotation,
+             self._opacity,
+             self.max_radii2D,
+             self.max_weight,
+             xyz_gradient_accum,
+             xyz_gradient_accum_abs,
+             denom,
+             denom_abs,
+             opt_dict,
+             self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.xyz_gradient_accum_abs = xyz_gradient_accum_abs
         self.denom = denom
         self.denom_abs = denom_abs
+        # If older ckpt: initialize bg prune buffers to zeros.
+        if self.bg_prune_seen.numel() == 0 or self.bg_prune_seen.shape[0] != self.get_xyz.shape[0]:
+            self.bg_prune_seen = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        if self.bg_prune_hit.numel() == 0 or self.bg_prune_hit.shape[0] != self.get_xyz.shape[0]:
+            self.bg_prune_hit = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -202,6 +236,9 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # bg prune accumulators (persistent across iters; do not reset elsewhere)
+        self.bg_prune_seen = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.bg_prune_hit = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.abs_split_radii2D_threshold = training_args.abs_split_radii2D_threshold
         self.max_abs_split_points = training_args.max_abs_split_points
         self.max_all_points = training_args.max_all_points
@@ -265,8 +302,14 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    def reset_opacity(self):
-        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+    def reset_opacity(self, reset_value=0.01):
+        """
+        Reset opacity to a low value for aggressive pruning.
+        
+        Args:
+            reset_value: Target opacity value after reset (default 0.01, 3D-UIR style)
+        """
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * reset_value))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -365,6 +408,11 @@ class GaussianModel:
         self.denom_abs = self.denom_abs[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.max_weight = self.max_weight[valid_points_mask]
+        # bg prune accumulators
+        if self.bg_prune_seen.numel() > 0:
+            self.bg_prune_seen = self.bg_prune_seen[valid_points_mask]
+        if self.bg_prune_hit.numel() > 0:
+            self.bg_prune_hit = self.bg_prune_hit[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -388,7 +436,8 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                              new_bg_prune_seen=None, new_bg_prune_hit=None):
         d = {"xyz": new_xyz,
         "knn_f": new_knn_f,
         "f_dc": new_features_dc,
@@ -411,6 +460,23 @@ class GaussianModel:
         self.denom_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # Extend bg prune accumulators WITHOUT resetting existing stats.
+        if self.bg_prune_seen.numel() == 0:
+            self.bg_prune_seen = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        else:
+            if new_bg_prune_seen is None:
+                ext = torch.zeros((new_xyz.shape[0], 1), device="cuda")
+            else:
+                ext = new_bg_prune_seen
+            self.bg_prune_seen = torch.cat([self.bg_prune_seen, ext], dim=0)
+        if self.bg_prune_hit.numel() == 0:
+            self.bg_prune_hit = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        else:
+            if new_bg_prune_hit is None:
+                ext = torch.zeros((new_xyz.shape[0], 1), device="cuda")
+            else:
+                ext = new_bg_prune_hit
+            self.bg_prune_hit = torch.cat([self.bg_prune_hit, ext], dim=0)
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, max_radii2D, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -457,7 +523,11 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_knn_f = self._knn_f[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        # bg prune accumulator inheritance: children inherit parent stats
+        new_seen = self.bg_prune_seen[selected_pts_mask].repeat(N, 1) if self.bg_prune_seen.numel() > 0 else None
+        new_hit = self.bg_prune_hit[selected_pts_mask].repeat(N, 1) if self.bg_prune_hit.numel() > 0 else None
+        self.densification_postfix(new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation,
+                                   new_bg_prune_seen=new_seen, new_bg_prune_hit=new_hit)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -493,7 +563,11 @@ class GaussianModel:
             new_rotation = self._rotation[selected_pts_mask]
             new_knn_f = self._knn_f[selected_pts_mask]
 
-            self.densification_postfix(new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+            # bg prune accumulator inheritance: clones inherit parent stats
+            new_seen = self.bg_prune_seen[selected_pts_mask] if self.bg_prune_seen.numel() > 0 else None
+            new_hit = self.bg_prune_hit[selected_pts_mask] if self.bg_prune_hit.numel() > 0 else None
+            self.densification_postfix(new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                                       new_bg_prune_seen=new_seen, new_bg_prune_hit=new_hit)
 
     def densify_and_prune(self, max_grad, abs_max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

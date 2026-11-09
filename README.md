@@ -1,3 +1,56 @@
+# UW_PGSR / GeoMed-GS
+
+基于 [PGSR](https://github.com/zju3dv/PGSR) 的水下多视图高斯重建工程。当前主线联合优化介质前高斯外观、水体衰减与后向散射，并通过背景闭合、远区域增密过滤、背景不透明度约束和多视角冲突剪枝减少水体被解释为几何的现象。
+
+完整代码与脚本索引见 [项目结构说明](docs/PROJECT_STRUCTURE.md)。下方保留 PGSR 原始说明、引用与致谢；水下工程的入口和数据布局以本节及当前源码为准。
+
+## 环境与安装
+
+需要 NVIDIA GPU、与 PyTorch 匹配的 CUDA 工具链，以及可编译本地 CUDA 扩展的 C++ 编译环境。先安装适合本机 CUDA 的 PyTorch / torchvision，再安装依赖和两个源码扩展：
+
+```bash
+git clone https://github.com/MokiSumiwo/UW_PGSR.git
+cd UW_PGSR
+python -m pip install -r requirements.txt
+python -m pip install numpy scipy Pillow tqdm matplotlib imageio OpenEXR
+python -m pip install ./submodules/diff-plane-rasterization
+python -m pip install ./submodules/simple-knn
+# 可选：metrics3.py 的 NIQE 指标
+python -m pip install pyiqa
+```
+
+`pytorch3d` 需要选择与 PyTorch/CUDA 匹配的构建，必要时参照其官方安装方法单独安装。本仓库没有锁定完整环境版本；此安装说明来自源码依赖核对，不代表已完成全新环境训练验证。
+
+## 单场景训练、渲染与评估
+
+当前默认数据布局：
+
+```text
+scene/
+├── images/
+│   ├── ColorImage/              # 水下 RGB
+│   ├── fake_air_Deep_Sea-NN/     # 可选，同名伪清晰图
+│   ├── DepthImage/              # 可选，评估用深度 EXR
+│   └── NormalImage/             # 可选，评估用法线 EXR
+└── sparse/0/                   # COLMAP 相机、位姿和稀疏点云
+```
+
+也支持直接位于 `sparse/` 的 COLMAP 文件。自定义图像目录可通过 `--images` 指定。
+
+```bash
+python train.py -s /path/to/scene -m outputs/scene --eval
+python render.py -s /path/to/scene -m outputs/scene --iteration 30000 --skip_train
+python metrics3.py -m outputs/scene -s /path/to/scene
+# 有配对清晰图像时，用于评估：
+python metrics3.py -m outputs/scene -s /path/to/scene --air_source_path /path/to/air
+```
+
+`render.py` 的网格提取深度与体素尺度需要按场景调整。伪清晰监督在有对应图像且权重大于 0 时生效；如需关闭，训练命令增加 `--lambda_fake_air 0 --lambda_fake_air_lap 0 --lambda_fake_air_lpips 0`。
+
+历史实验脚本中有尚未与当前训练入口对齐的 `--experiment_profile` 参数，批量运行前请阅读 [脚本状态说明](docs/PROJECT_STRUCTURE.md)。训练输出、数据、编译缓存、权重和本地论文材料不随源码提交。
+
+---
+
 # PGSR: Planar-based Gaussian Splatting for Efficient and High-Fidelity Surface Reconstruction
 Danpeng Chen, Hai Li, [Weicai Ye](https://ywcmaike.github.io/), Yifan Wang, Weijian Xie, Shangjin Zhai, Nan Wang, Haomin Liu, Hujun Bao, [Guofeng Zhang](http://www.cad.zju.edu.cn/home/gfzhang/)
 ### [Project Page](https://zju3dv.github.io/pgsr/) | [arXiv](https://arxiv.org/abs/2406.06521)

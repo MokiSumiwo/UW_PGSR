@@ -43,13 +43,31 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        # 检查场景类型，添加更详细的错误信息
+        sparse_path = os.path.join(args.source_path, "sparse")
+        transforms_path = os.path.join(args.source_path, "transforms_train.json")
+        
+        if os.path.exists(sparse_path):
+            print(f"Detected Colmap scene type. Loading from: {args.source_path}")
+            print(f"Images path: {args.images}")
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        elif os.path.exists(transforms_path):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:
-            assert False, "Could not recognize scene type!"
+            # 提供更详细的错误信息
+            print(f"Error: Could not recognize scene type!")
+            print(f"Source path: {args.source_path}")
+            print(f"Looking for:")
+            print(f"  - Colmap format: {sparse_path} (exists: {os.path.exists(sparse_path)})")
+            print(f"  - Blender format: {transforms_path} (exists: {os.path.exists(transforms_path)})")
+            print(f"Available files in source path:")
+            if os.path.exists(args.source_path):
+                for item in os.listdir(args.source_path):
+                    item_path = os.path.join(args.source_path, item)
+                    item_type = "DIR" if os.path.isdir(item_path) else "FILE"
+                    print(f"  - {item} ({item_type})")
+            assert False, f"Could not recognize scene type! Please check if the source path is correct: {args.source_path}"
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:

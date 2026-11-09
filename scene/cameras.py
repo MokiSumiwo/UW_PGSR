@@ -48,13 +48,23 @@ def process_image(image_path, resolution, ncc_scale):
     gray_image = (0.299 * resized_image_rgb[0] + 0.587 * resized_image_rgb[1] + 0.114 * resized_image_rgb[2])[None]
     return gt_image, gray_image, loaded_mask
 
+LOAD_METRIC_NORMALS = False
+
+
+def set_metric_normals_loading(enabled: bool):
+    global LOAD_METRIC_NORMALS
+    LOAD_METRIC_NORMALS = enabled
+
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy,
                  image_width, image_height,
                  image_path, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, 
                  ncc_scale=1.0,
-                 preload_img=True, data_device = "cuda"
+                 preload_img=True, data_device = "cuda",
+                 invdepthmap=None, depth_params=None,
+                 fake_air_path: str = None
                  ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -90,6 +100,41 @@ class Camera(nn.Module):
             self.original_image_gray = gray_image.to(self.data_device)
             self.mask = loaded_mask
 
+        # Optional pseudo "clear-scene/air" supervision image (e.g. Deep_Sea-NN output)
+        self.fake_air_path = fake_air_path
+        self.fake_air_image = None
+        self.fake_air_image_gray = None
+        if self.preload_img and (self.fake_air_path is not None) and os.path.exists(self.fake_air_path):
+            try:
+                fa, fa_gray, _ = process_image(self.fake_air_path, self.resolution, ncc_scale)
+                self.fake_air_image = fa.to(self.data_device)
+                self.fake_air_image_gray = fa_gray.to(self.data_device)
+            except Exception as e:
+                print(f"[Camera] Warning: failed to preload fake-air image for {self.image_name}: {e}")
+
+        self.invdepthmap = None
+        self.depth_reliable = False
+        if invdepthmap is not None:
+            if self.mask is not None:
+                self.depth_mask = torch.ones_like(self.mask)
+            else:
+                self.depth_mask = torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+            
+            self.invdepthmap = cv2.resize(invdepthmap, self.resolution)
+            self.invdepthmap[self.invdepthmap < 0] = 0
+            self.depth_reliable = True
+
+            if depth_params is not None:
+                # if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
+                #     self.depth_reliable = False
+                #     self.depth_mask *= 0
+                
+                if depth_params["scale"] > 0:
+                    self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
+
+            if self.invdepthmap.ndim != 2:
+                self.invdepthmap = self.invdepthmap[..., 0]
+            self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -103,12 +148,86 @@ class Camera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         self.plane_mask, self.non_plane_mask = None, None
 
+        # === Optional: load pre-computed Metric3D normals (if available) ===
+        # 期望的目录结构（与训练一致）:
+        #   source_path/
+        #       images/ColorImage/XXX.png   (训练图像)
+        #       metric3d_normals/XXX.pt     (本脚本生成)
+        # 这里根据 image_path 反推 source_path，然后到 metric3d_normals 里找同名 .pt。
+        self.metric_normal = None
+        self.metric_normal_conf = None
+        try:
+            images_dir = os.path.dirname(self.image_path)
+            source_path = os.path.dirname(os.path.dirname(images_dir))
+            metric_root = os.path.join(source_path, "metric3d_normals")
+            metric_path = os.path.join(metric_root, self.image_name + ".pt")
+
+            if LOAD_METRIC_NORMALS and os.path.exists(metric_path):
+                data = torch.load(metric_path, map_location=self.data_device)
+                mn = data.get("metric_normal", None)           # [1,3,H,W] or [3,H,W]
+                mc = data.get("metric_normal_conf", None)      # [1,1,H,W] or [1,H,W] or [H,W]
+
+                if mn is not None:
+                    mn = mn.to(self.data_device)
+                    if mn.dim() == 4:  # [1,3,H,W]
+                        mn = mn[0]
+                    if mn.shape[0] != 3:
+                        # 防止 shape 异常
+                        mn = mn[:3]
+                    # Resize to current camera resolution if needed
+                    if mn.shape[1:] != (self.image_height, self.image_width):
+                        mn = F.interpolate(
+                            mn.unsqueeze(0),
+                            size=(self.image_height, self.image_width),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                    self.metric_normal = mn
+
+                if mc is not None:
+                    mc = mc.to(self.data_device)
+                    # 统一成 [1,H,W]
+                    if mc.dim() == 4:  # [1,1,H,W]
+                        mc = mc[:, 0]
+                    if mc.dim() == 3 and mc.shape[0] == 1:
+                        pass  # [1,H,W]
+                    elif mc.dim() == 2:
+                        mc = mc.unsqueeze(0)
+                    # Resize if needed
+                    if mc.shape[1:] != (self.image_height, self.image_width):
+                        mc = F.interpolate(
+                            mc.unsqueeze(0),
+                            size=(self.image_height, self.image_width),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                    self.metric_normal_conf = mc
+        except Exception as e:
+            print(f"[Camera] Warning: failed to load Metric3D normals for {self.image_name}: {e}")
+
     def get_image(self):
         if self.preload_img:
             return self.original_image.cuda(), self.original_image_gray.cuda()
         else:
             gt_image, gray_image, _ = process_image(self.image_path, self.resolution, self.ncc_scale)
             return gt_image.cuda(), gray_image.cuda()
+
+    def get_fake_air_image(self):
+        """
+        Returns:
+            (fake_air_rgb, fake_air_gray) if available, else (None, None)
+        Shapes are consistent with get_image(): RGB is [3,H,W], gray is [1,H,W].
+        """
+        if self.fake_air_path is None or (not os.path.exists(self.fake_air_path)):
+            return None, None
+        if self.preload_img and self.fake_air_image is not None:
+            return self.fake_air_image.cuda(), self.fake_air_image_gray.cuda()
+        try:
+            fa, fa_gray, _ = process_image(self.fake_air_path, self.resolution, self.ncc_scale)
+            return fa.cuda(), fa_gray.cuda()
+        except Exception as e:
+            print(f"[Camera] Warning: failed to load fake-air image for {self.image_name}: {e}")
+            return None, None
 
     def get_calib_matrix_nerf(self, scale=1.0):
         intrinsic_matrix = torch.tensor([[self.Fx/scale, 0, self.Cx/scale], [0, self.Fy/scale, self.Cy/scale], [0, 0, 1]]).float()

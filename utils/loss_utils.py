@@ -139,3 +139,44 @@ def lncc(ref, nea):
     ncc = torch.mean(ncc, dim=1, keepdim=True)
     mask = (ncc < 0.9)
     return ncc, mask
+
+def anisotropic_total_variation_loss(img):
+    """
+    Calculate the Anisotropic Total Variation loss.
+    """
+    if len(img.shape) == 2:
+        img = img.unsqueeze(0)
+    
+    h_variance = torch.sum(torch.abs(img[:, :, :-1] - img[:, :, 1:]))
+    w_variation = torch.sum(torch.abs(img[:, :-1, :] - img[:, 1:, :]))
+    return h_variance + w_variation
+
+def depth_aware_smooth_loss(invDepth, rgb_image, depth_mask=None, gamma=0.001):
+    """
+    Calculate the depth-aware smoothness loss.
+    """
+    def gradient_x(img):
+        return img[:, :, :-1] - img[:, :, 1:]
+
+    def gradient_y(img):
+        return img[:, :-1, :] - img[:, 1:, :]
+
+    depth_grad_x = gradient_x(invDepth)
+    depth_grad_y = gradient_y(invDepth)
+    
+    rgb_grad_x = gradient_x(rgb_image)
+    rgb_grad_y = gradient_y(rgb_image)
+    
+    weight_x = torch.exp(-torch.mean(torch.abs(rgb_grad_x), dim=0, keepdim=True) * gamma)
+    weight_y = torch.exp(-torch.mean(torch.abs(rgb_grad_y), dim=0, keepdim=True) * gamma)
+    
+    if depth_mask is not None:
+        mask_x = depth_mask[:, :, :-1] * depth_mask[:, :, 1:]
+        mask_y = depth_mask[:, :-1, :] * depth_mask[:, 1:, :]
+        smoothness_x = torch.abs(depth_grad_x) * weight_x * mask_x
+        smoothness_y = torch.abs(depth_grad_y) * weight_y * mask_y
+    else:
+        smoothness_x = torch.abs(depth_grad_x) * weight_x
+        smoothness_y = torch.abs(depth_grad_y) * weight_y
+        
+    return smoothness_x.mean() + smoothness_y.mean()
